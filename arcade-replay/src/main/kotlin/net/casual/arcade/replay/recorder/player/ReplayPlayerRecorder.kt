@@ -6,10 +6,12 @@ package net.casual.arcade.replay.recorder.player
 
 import com.mojang.authlib.GameProfile
 import net.casual.arcade.events.GlobalEventHandler
+import net.casual.arcade.utils.ArcadeUtils
 import net.casual.arcade.utils.compat.PolymerCompatLayer
 import net.casual.arcade.replay.events.player.ReplayPlayerRecorderSnapshotEvent
 import net.casual.arcade.replay.io.ReplayFormat
 import net.casual.arcade.replay.recorder.ChunkSender
+import net.casual.arcade.replay.recorder.ChunkSender.SeenEntities
 import net.casual.arcade.replay.recorder.ReplayRecorder
 import net.casual.arcade.replay.recorder.rejoin.RejoinedReplayPlayer
 import net.casual.arcade.utils.entity.WrappedTrackedEntity
@@ -30,8 +32,11 @@ import net.minecraft.server.level.ServerEntity
 import net.minecraft.server.level.ServerLevel
 import net.minecraft.server.level.ServerPlayer
 import net.minecraft.world.entity.Entity
+import net.minecraft.network.protocol.game.ClientboundLevelChunkWithLightPacket
+import net.minecraft.util.Util
 import net.minecraft.world.item.ItemStack
 import net.minecraft.world.level.ChunkPos
+import net.minecraft.world.level.chunk.LevelChunk
 import net.minecraft.world.phys.Vec2
 import net.minecraft.world.phys.Vec3
 import org.jetbrains.annotations.ApiStatus.Internal
@@ -117,6 +122,34 @@ public class ReplayPlayerRecorder internal constructor(
         this.sendChunksAndEntities()
         GlobalEventHandler.Server.broadcast(ReplayPlayerRecorderSnapshotEvent(this, true))
         return true
+    }
+
+    override fun initializeAsync(): CompletableFuture<Boolean> {
+        val player = this.player ?: return CompletableFuture.completedFuture(false)
+        RejoinedReplayPlayer.rejoin(player, this)
+        this.spawnPlayer(player, listOf(ClientboundAddEntityPacket(player)))
+        this.sendMapData(player)
+        this.sendChunkViewDistance()
+
+        // Collect loaded chunk references on server thread (fast cache lookups)
+        val source = this.level.chunkSource
+        val chunks = ArrayList<LevelChunk>()
+        this.forEachChunk { pos ->
+            val chunk = source.getChunkNow(pos.x, pos.z)
+            if (chunk != null) chunks.add(chunk)
+        }
+        val lightEngine = this.level.lightEngine
+
+        // Serialize chunk packets off the server thread
+        return CompletableFuture.runAsync({
+            for (chunk in chunks) {
+                if (this.stopped) return@runAsync
+                this.sendChunkPacket(ClientboundLevelChunkWithLightPacket(chunk, lightEngine, null, null))
+            }
+        }, Util.backgroundExecutor()).thenRunAsync({
+            this.sendChunkEntities(SeenEntities.mutable())
+            GlobalEventHandler.Server.broadcast(ReplayPlayerRecorderSnapshotEvent(this, true))
+        }, this.server).thenApply { true }
     }
 
     /**

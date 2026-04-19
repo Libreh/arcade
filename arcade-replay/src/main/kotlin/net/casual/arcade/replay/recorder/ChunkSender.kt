@@ -14,11 +14,13 @@ import net.casual.arcade.utils.entity.WrappedTrackedEntity
 import net.minecraft.network.protocol.Packet
 import net.minecraft.network.protocol.game.*
 import net.minecraft.server.level.ServerLevel
+import net.minecraft.server.level.TicketType
 import net.minecraft.world.entity.Entity
 import net.minecraft.world.entity.Mob
 import net.minecraft.world.level.ChunkPos
 import net.minecraft.world.level.chunk.LevelChunk
 import org.jetbrains.annotations.ApiStatus.*
+import java.util.concurrent.CompletableFuture
 import java.util.function.Consumer
 import kotlin.math.min
 
@@ -104,6 +106,46 @@ public interface ChunkSender {
         this.sendChunkViewDistance()
         this.sendChunks(seen, unloaded)
         this.sendChunkEntities(seen)
+    }
+
+    /**
+     * Batch-preloads all chunks in the view distance asynchronously
+     * using a single ticket and distance manager update.
+     *
+     * The caller must remove the [TicketType.PLAYER_LOADING] ticket
+     * after consuming the chunks (see [sendChunksAndEntitiesAsync]).
+     *
+     * @return A future that completes when all chunks are loaded.
+     */
+    @NonExtendable
+    public fun preloadChunksAsync(): CompletableFuture<Void> {
+        val source = this.level.chunkSource
+        val center = this.getCenterChunk()
+        val viewDistance = this.getViewDistance()
+        return source.addTicketAndLoadWithRadius(TicketType.PLAYER_LOADING, center, viewDistance)
+            .thenRun {}
+    }
+
+    /**
+     * Async variant of [sendChunksAndEntities]. Sends chunk view distance
+     * synchronously, batch-preloads chunks in the background, then sends
+     * chunk and entity packets on the server thread once chunks are loaded.
+     *
+     * @return A future that completes when all packets have been sent.
+     */
+    @NonExtendable
+    public fun sendChunksAndEntitiesAsync(unloaded: (ChunkPos) -> Boolean = { false }): CompletableFuture<Void> {
+        val seen = SeenEntities.mutable()
+        val source = this.level.chunkSource
+        val center = this.getCenterChunk()
+        val viewDistance = this.getViewDistance()
+        this.sendChunkViewDistance()
+        return source.addTicketAndLoadWithRadius(TicketType.PLAYER_LOADING, center, viewDistance)
+            .thenRunAsync({
+                this.sendChunks(seen, unloaded)
+                this.sendChunkEntities(seen)
+                source.removeTicketWithRadius(TicketType.PLAYER_LOADING, center, viewDistance)
+            }, this.level.server!!)
     }
 
     /**
