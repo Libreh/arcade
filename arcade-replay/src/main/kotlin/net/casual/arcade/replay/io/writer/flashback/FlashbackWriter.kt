@@ -113,9 +113,15 @@ public class FlashbackWriter(
     }
 
     override fun endInitialization() {
-        this.executor.execute {
-            this.writer.endSnapshot()
-            this.writer.writeAction(FlashbackAction.NextTick)
+        if (this.closed) return
+        try {
+            this.executor.execute {
+                if (!this.writer.isTakingSnapshot()) return@execute
+                this.writer.endSnapshot()
+                this.writer.writeAction(FlashbackAction.NextTick)
+            }
+        } catch (_: java.util.concurrent.RejectedExecutionException) {
+            // Executor was shut down by close() before init completed
         }
     }
 
@@ -216,7 +222,9 @@ public class FlashbackWriter(
             }
             this.close(save, ::write, this.writer::close)
         }, this.executor)
-        this.executor.shutdown()
+        future.whenComplete { _, _ ->
+            this.executor.shutdown()
+        }
         return future
     }
 

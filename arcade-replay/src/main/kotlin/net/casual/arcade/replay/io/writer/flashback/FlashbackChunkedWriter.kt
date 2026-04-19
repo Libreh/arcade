@@ -44,6 +44,10 @@ public class FlashbackChunkedWriter(
         this.meta = this.meta.copy(markers = this.markers)
     }
 
+    public fun isTakingSnapshot(): Boolean {
+        return this.snapshot is SnapshotState.Taking
+    }
+
     public fun startSnapshot() {
         when (this.snapshot) {
             is SnapshotState.Taking -> throw IllegalStateException("Already taking a snapshot")
