@@ -221,6 +221,46 @@ public abstract class ReplayRecorder(
     }
 
     /**
+     * Async variant of [start]. Begins initialization synchronously,
+     * then allows subclasses to perform async work (e.g. chunk preloading)
+     * before completing initialization on the server thread.
+     *
+     * @param mode Whether this is starting or restarting a recording.
+     * @return A future completing with whether the recording started successfully.
+     */
+    public fun startAsync(mode: StartingMode = StartingMode.Start): CompletableFuture<Boolean> {
+        if (this.started) {
+            return CompletableFuture.completedFuture(false)
+        }
+
+        this.started = true
+        this.start = Clock.System.now()
+        this.protocol = GameProtocols.CLIENTBOUND_TEMPLATE.bind(RegistryFriendlyByteBuf.decorator(this.server.registryAccess()))
+
+        this.initialization.set(InitializedState.Manual)
+        this.writer.beginInitialization()
+
+        return this.initializeAsync().handleAsync({ result, error ->
+            try {
+                this.writer.endInitialization()
+                this.initialization.set(InitializedState.Initialized)
+            } catch (e: Exception) {
+                ArcadeUtils.logger.error("Error in endInitialization", e)
+            }
+
+            if (error != null) {
+                ArcadeUtils.logger.error("Failed to initialize replay asynchronously", error)
+                return@handleAsync false
+            }
+
+            if (result == true) {
+                this.onStart(mode)
+            }
+            result ?: false
+        }, this.server)
+    }
+
+    /**
      * Tries to pause the recording for this recorder.
      *
      * This method may not be successful based on whether
@@ -482,6 +522,17 @@ public abstract class ReplayRecorder(
      * This method should just simulate the player joining the server.
      */
     protected abstract fun initialize(): Boolean
+
+    /**
+     * Async variant of [initialize]. Override this to perform async
+     * initialization (e.g. async chunk preloading). The default
+     * implementation delegates to the sync [initialize].
+     *
+     * @return A future completing with whether initialization succeeded.
+     */
+    protected open fun initializeAsync(): CompletableFuture<Boolean> {
+        return CompletableFuture.completedFuture(this.initialize())
+    }
 
     /**
      * This gets called when the replay is closing.
