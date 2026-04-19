@@ -38,6 +38,7 @@ import net.minecraft.network.protocol.common.ClientboundResourcePackPopPacket
 import net.minecraft.network.protocol.common.ClientboundResourcePackPushPacket
 import net.minecraft.network.protocol.game.*
 import net.minecraft.network.protocol.game.ClientboundGameEventPacket.CHANGE_GAME_MODE
+import net.minecraft.network.protocol.game.ServerboundUseItemPacket
 import net.minecraft.network.protocol.game.ClientboundPlayerInfoUpdatePacket.Action
 import net.minecraft.server.MinecraftServer
 import net.minecraft.server.level.ServerBossEvent
@@ -46,6 +47,7 @@ import net.minecraft.server.network.ServerGamePacketListenerImpl
 import net.minecraft.world.BossEvent.BossBarColor
 import net.minecraft.world.BossEvent.BossBarOverlay
 import net.minecraft.world.entity.Entity
+import net.minecraft.world.entity.player.Abilities
 import net.minecraft.world.entity.PositionMoveRotation
 import net.minecraft.world.entity.Relative
 import net.minecraft.world.level.ChunkPos
@@ -96,6 +98,15 @@ public class ReplayViewer internal constructor(
 
     private var position = Vec3.ZERO
 
+    public var useItemHandler: ((ReplayViewer) -> Unit)? = null
+    public var onReadyHandler: ((ReplayViewer) -> Unit)? = null
+    public var onStopHandler: ((ReplayViewer) -> Unit)? = null
+    public var viewerGameMode: GameType = GameType.SPECTATOR
+
+    public fun sendToViewer(packet: Packet<*>) {
+        this.send(packet)
+    }
+
     public val gameProtocol: ProtocolInfo<ClientGamePacketListener> = GameProtocols.CLIENTBOUND_TEMPLATE.bind(
         RegistryFriendlyByteBuf.decorator(this.server.registryAccess())
     )
@@ -129,6 +140,7 @@ public class ReplayViewer internal constructor(
     }
 
     public fun stop() {
+        this.onStopHandler?.invoke(this)
         this.close()
 
         this.removeReplayState()
@@ -234,6 +246,14 @@ public class ReplayViewer internal constructor(
         when (packet) {
             is ServerboundChatCommandPacket -> ReplayViewerCommands.handleCommand(packet.command, this)
             is ServerboundChatCommandSignedPacket -> ReplayViewerCommands.handleCommand(packet.command, this)
+            is ServerboundUseItemPacket -> {
+                val handler = this.useItemHandler
+                if (handler != null) {
+                    this.server.execute { handler(this) }
+                } else {
+                    return false
+                }
+            }
             else -> return false
         }
         return true
@@ -474,7 +494,7 @@ public class ReplayViewer internal constructor(
             this.player.gameProfile,
             false,
             0,
-            GameType.SPECTATOR,
+            this.viewerGameMode,
             null,
             true,
             0,
@@ -488,8 +508,14 @@ public class ReplayViewer internal constructor(
     }
 
     private fun shouldSendPacket(packet: Packet<*>, time: Duration): Boolean {
+        val nonSpectator = this.viewerGameMode != GameType.SPECTATOR
         return when (packet) {
             is ClientboundGameEventPacket -> packet.event != CHANGE_GAME_MODE
+            is ClientboundPlayerAbilitiesPacket -> !nonSpectator
+            is ClientboundContainerSetContentPacket -> !nonSpectator
+            is ClientboundContainerSetSlotPacket -> !nonSpectator
+            is ClientboundSetHealthPacket -> !nonSpectator
+            is ClientboundSetExperiencePacket -> !nonSpectator
             is ClientboundPlayerPositionPacket -> {
                 if (!packet.relatives.containsAll(setOf(Relative.X, Relative.Y, Relative.Z))) {
                     this.position = packet.change.position
@@ -528,14 +554,27 @@ public class ReplayViewer internal constructor(
         }
     }
 
+    private fun sendViewerAbilities() {
+        if (this.viewerGameMode != GameType.SPECTATOR) {
+            val abilities = Abilities()
+            abilities.mayfly = true
+            abilities.flying = true
+            abilities.invulnerable = true
+            this.send(ClientboundPlayerAbilitiesPacket(abilities))
+        }
+    }
+
     private fun afterSendPacket(packet: Packet<*>) {
         when (packet) {
             is ClientboundLoginPacket -> {
                 this.synchronizeClientLevel()
-                this.send(ClientboundGameEventPacket(CHANGE_GAME_MODE, GameType.SPECTATOR.id.toFloat()))
+                this.send(ClientboundGameEventPacket(CHANGE_GAME_MODE, this.viewerGameMode.id.toFloat()))
+                this.sendViewerAbilities()
+                this.onReadyHandler?.invoke(this)
             }
             is ClientboundRespawnPacket -> {
-                this.send(ClientboundGameEventPacket(CHANGE_GAME_MODE, GameType.SPECTATOR.id.toFloat()))
+                this.send(ClientboundGameEventPacket(CHANGE_GAME_MODE, this.viewerGameMode.id.toFloat()))
+                this.sendViewerAbilities()
             }
         }
     }
