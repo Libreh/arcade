@@ -37,6 +37,7 @@
     "rejoin.ServerConfigurationPacketListenerImplMixin",
     "rejoin.ServerPlayerMixin",
     "studio.CustomViaPlatformMixin",
+    "viewer.ClientboundMoveEntityPacketAccessor",
     "viewer.ClientboundPlayerInfoUpdatePacketAccessor",
     "viewer.EntityInvoker",
     "viewer.ServerGamePacketListenerImplMixin"

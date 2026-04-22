@@ -4,11 +4,15 @@
  */
 package net.casual.arcade.replay.viewer
 
+import it.unimi.dsi.fastutil.ints.Int2ObjectOpenHashMap
 import it.unimi.dsi.fastutil.ints.IntArrayList
 import it.unimi.dsi.fastutil.ints.IntOpenHashSet
 import it.unimi.dsi.fastutil.ints.IntSets
 import it.unimi.dsi.fastutil.longs.LongOpenHashSet
 import it.unimi.dsi.fastutil.longs.LongSets
+import com.mojang.authlib.GameProfile
+import io.netty.buffer.Unpooled
+import it.unimi.dsi.fastutil.objects.Object2IntOpenHashMap
 import kotlinx.coroutines.*
 import net.casual.arcade.events.GlobalEventHandler
 import net.casual.arcade.events.ListenerRegistry.Companion.register
@@ -16,6 +20,7 @@ import net.casual.arcade.events.server.player.PlayerServerboundPacketEvent
 import net.casual.arcade.host.GlobalPackHost
 import net.casual.arcade.replay.ducks.PackTracker
 import net.casual.arcade.replay.io.reader.ReplayReader
+import net.casual.arcade.replay.mixins.viewer.ClientboundMoveEntityPacketAccessor
 import net.casual.arcade.replay.mixins.viewer.EntityInvoker
 import net.casual.arcade.replay.recorder.rejoin.RejoinedReplayPlayer
 import net.casual.arcade.replay.util.ReplayMarker
@@ -31,6 +36,7 @@ import net.minecraft.client.Minecraft
 import net.minecraft.core.UUIDUtil
 import net.minecraft.network.ConnectionProtocol
 import net.minecraft.network.ProtocolInfo
+import net.minecraft.network.FriendlyByteBuf
 import net.minecraft.network.RegistryFriendlyByteBuf
 import net.minecraft.network.chat.Component
 import net.minecraft.network.protocol.Packet
@@ -38,6 +44,7 @@ import net.minecraft.network.protocol.common.ClientboundResourcePackPopPacket
 import net.minecraft.network.protocol.common.ClientboundResourcePackPushPacket
 import net.minecraft.network.protocol.game.*
 import net.minecraft.network.protocol.game.ClientboundGameEventPacket.CHANGE_GAME_MODE
+import net.minecraft.network.protocol.game.ServerboundSwingPacket
 import net.minecraft.network.protocol.game.ServerboundUseItemPacket
 import net.minecraft.network.protocol.game.ClientboundPlayerInfoUpdatePacket.Action
 import net.minecraft.server.MinecraftServer
@@ -63,6 +70,7 @@ import java.util.function.Supplier
 import kotlin.io.path.nameWithoutExtension
 import kotlin.math.abs
 import kotlin.time.Duration
+import kotlin.time.Duration.Companion.milliseconds
 
 public class ReplayViewer internal constructor(
     supplier: (ReplayViewer) -> ReplayReader,
@@ -87,20 +95,29 @@ public class ReplayViewer internal constructor(
     private val entities = IntSets.synchronize(IntOpenHashSet())
     private val players = Collections.synchronizedList(ArrayList<UUID>())
     private val objectives = Collections.synchronizedCollection(ArrayList<String>())
+    private val playerEntityIds = Object2IntOpenHashMap<UUID>().also { it.defaultReturnValue(-1) }
+    private val playerProfiles = HashMap<UUID, GameProfile>()
+    private val entityTransforms = Int2ObjectOpenHashMap<EntityTransform>()
+    private var spectatingEntityId: Int = -1
+
+    public data class EntityTransform(val position: Vec3, val yRot: Float, val xRot: Float)
 
     private val bossbar = ServerBossEvent(UUID.randomUUID(), Component.empty(), BossBarColor.BLUE, BossBarOverlay.PROGRESS)
 
     private val previousPacks = ArrayList<ClientboundResourcePackPushPacket>()
 
     private var lastSentProgress = Duration.INFINITE
-    private var progress = Duration.ZERO
+    public var progress: Duration = Duration.ZERO
+        private set
     private var target = Duration.ZERO
 
     private var position = Vec3.ZERO
 
     public var useItemHandler: ((ReplayViewer) -> Unit)? = null
+    public var attackHandler: ((ReplayViewer) -> Unit)? = null
     public var onReadyHandler: ((ReplayViewer) -> Unit)? = null
     public var onStopHandler: ((ReplayViewer) -> Unit)? = null
+    public var onSpectateChangeHandler: ((ReplayViewer) -> Unit)? = null
     public var viewerGameMode: GameType = GameType.SPECTATOR
 
     public fun sendToViewer(packet: Packet<*>) {
@@ -160,6 +177,10 @@ public class ReplayViewer internal constructor(
         ReplayViewers.remove(this.player.uuid)
     }
 
+    public fun getProgressMillis(): Long = this.progress.inWholeMilliseconds
+
+    public fun jumpToMillis(millis: Long): Boolean = this.jumpTo(millis.milliseconds)
+
     public fun jumpTo(timestamp: Duration): Boolean {
         if (timestamp.isNegative() || timestamp > this.reader.duration) {
             return false
@@ -201,6 +222,7 @@ public class ReplayViewer internal constructor(
         }
         this.paused = paused
         this.sendTickingState()
+        this.lastSentProgress = Duration.INFINITE.unaryMinus()
         this.updateProgress(this.progress)
         return true
     }
@@ -241,6 +263,59 @@ public class ReplayViewer internal constructor(
         this.teleported = false
     }
 
+    public fun getReplayPlayers(): List<UUID> {
+        synchronized(this.playerEntityIds) {
+            return ArrayList(this.playerEntityIds.keys)
+        }
+    }
+
+    public fun getReplayPlayerEntityId(uuid: UUID): Int {
+        synchronized(this.playerEntityIds) {
+            return this.playerEntityIds.getInt(uuid)
+        }
+    }
+
+    public fun getReplayPlayerProfile(uuid: UUID): GameProfile? {
+        synchronized(this.playerProfiles) {
+            return this.playerProfiles[uuid]
+        }
+    }
+
+    public fun spectateReplayEntity(entityId: Int) {
+        this.spectatingEntityId = entityId
+        val buf = FriendlyByteBuf(Unpooled.buffer(5))
+        buf.writeVarInt(entityId)
+        this.send(ClientboundSetCameraPacket.STREAM_CODEC.decode(buf))
+        this.onSpectateChangeHandler?.invoke(this)
+    }
+
+    public fun stopSpectating() {
+        if (this.spectatingEntityId == -1) {
+            return
+        }
+        val spectated = this.spectatingEntityId
+        this.spectatingEntityId = -1
+
+        val target = synchronized(this.entityTransforms) { this.entityTransforms.get(spectated) }
+        if (target != null) {
+            this.position = target.position
+            this.send(ClientboundPlayerPositionPacket(
+                0, PositionMoveRotation(target.position, Vec3.ZERO, target.yRot, target.xRot), setOf()
+            ))
+        }
+
+        val buf = FriendlyByteBuf(Unpooled.buffer(5))
+        buf.writeVarInt(VIEWER_ID)
+        this.send(ClientboundSetCameraPacket.STREAM_CODEC.decode(buf))
+        this.onSpectateChangeHandler?.invoke(this)
+    }
+
+    private fun putTransform(entityId: Int, newPos: Vec3, yRot: Float, xRot: Float) {
+        synchronized(this.entityTransforms) {
+            this.entityTransforms.put(entityId, EntityTransform(newPos, yRot, xRot))
+        }
+    }
+
     private fun handleServerboundPacket(packet: Packet<*>): Boolean {
         // This is run async!
         when (packet) {
@@ -254,6 +329,20 @@ public class ReplayViewer internal constructor(
                     return false
                 }
             }
+            is ServerboundSwingPacket -> {
+                val handler = this.attackHandler
+                if (handler != null) {
+                    this.server.execute { handler(this) }
+                } else {
+                    return false
+                }
+            }
+            is ServerboundPlayerInputPacket -> {
+                if (packet.input.shift() && this.spectatingEntityId != -1) {
+                    this.server.execute { this.stopSpectating() }
+                }
+                return false
+            }
             else -> return false
         }
         return true
@@ -265,7 +354,6 @@ public class ReplayViewer internal constructor(
         }
         this.removeReplayState()
         this.coroutineScope.coroutineContext.cancelChildren()
-        this.teleported = false
         this.target = Duration.ZERO
 
         this.sendViewerPlayerInfo()
@@ -304,7 +392,7 @@ public class ReplayViewer internal constructor(
                     delay((time - lastTime) / this.speedMultiplier.toDouble())
                 }
 
-                while (this.shouldPauseStreaming()) {
+                while (time > this.target && this.shouldPauseStreaming()) {
                     delay(50)
                 }
 
@@ -459,6 +547,16 @@ public class ReplayViewer internal constructor(
         synchronized(this.entities) {
             this.send(ClientboundRemoveEntitiesPacket(IntArrayList(this.entities)))
         }
+        synchronized(this.playerEntityIds) {
+            this.playerEntityIds.clear()
+        }
+        synchronized(this.playerProfiles) {
+            this.playerProfiles.clear()
+        }
+        synchronized(this.entityTransforms) {
+            this.entityTransforms.clear()
+        }
+        this.spectatingEntityId = -1
         synchronized(this.chunks) {
             for (chunk in this.chunks.iterator()) {
                 this.connection.send(ClientboundForgetLevelChunkPacket(ChunkPos.unpack(chunk)))
@@ -520,11 +618,9 @@ public class ReplayViewer internal constructor(
                 if (!packet.relatives.containsAll(setOf(Relative.X, Relative.Y, Relative.Z))) {
                     this.position = packet.change.position
                 }
-                // We want the client to teleport to the first initial position
-                // later positions will teleport the viewer which we don't want
                 val teleported = this.teleported
                 this.teleported = true
-                !teleported || time < this.target
+                !teleported
             }
             else -> true
         }
@@ -535,8 +631,64 @@ public class ReplayViewer internal constructor(
         when (packet) {
             is ClientboundLevelChunkWithLightPacket -> this.chunks.add(ChunkPos.pack(packet.x, packet.z))
             is ClientboundForgetLevelChunkPacket -> this.chunks.remove(packet.pos.pack())
-            is ClientboundAddEntityPacket -> this.entities.add(packet.id)
-            is ClientboundRemoveEntitiesPacket -> this.entities.removeAll(packet.entityIds)
+            is ClientboundAddEntityPacket -> {
+                this.entities.add(packet.id)
+                this.putTransform(
+                    packet.id,
+                    Vec3(packet.x, packet.y, packet.z),
+                    packet.yRot,
+                    packet.xRot
+                )
+                val uuid = packet.uuid
+                val isPlayer = synchronized(this.players) { this.players.contains(uuid) }
+                if (isPlayer) {
+                    synchronized(this.playerEntityIds) {
+                        this.playerEntityIds.put(uuid, packet.id)
+                    }
+                }
+            }
+            is ClientboundMoveEntityPacket -> {
+                val entityId = (packet as ClientboundMoveEntityPacketAccessor).entityId
+                val previous = synchronized(this.entityTransforms) { this.entityTransforms.get(entityId) }
+                    ?: return
+                val newPos = if (packet.hasPosition()) {
+                    Vec3(
+                        previous.position.x + packet.xa / 4096.0,
+                        previous.position.y + packet.ya / 4096.0,
+                        previous.position.z + packet.za / 4096.0
+                    )
+                } else previous.position
+                val newYRot = if (packet.hasRotation()) packet.yRot * 360f / 256f else previous.yRot
+                val newXRot = if (packet.hasRotation()) packet.xRot * 360f / 256f else previous.xRot
+                this.putTransform(entityId, newPos, newYRot, newXRot)
+            }
+            is ClientboundTeleportEntityPacket -> {
+                val change = packet.change()
+                this.putTransform(packet.id(), change.position(), change.yRot(), change.xRot())
+            }
+            is ClientboundEntityPositionSyncPacket -> {
+                val values = packet.values()
+                this.putTransform(packet.id(), values.position(), values.yRot(), values.xRot())
+            }
+            is ClientboundRemoveEntitiesPacket -> {
+                this.entities.removeAll(packet.entityIds)
+                synchronized(this.entityTransforms) {
+                    for (i in 0 until packet.entityIds.size) {
+                        this.entityTransforms.remove(packet.entityIds.getInt(i))
+                    }
+                }
+                if (this.spectatingEntityId != -1 && packet.entityIds.contains(this.spectatingEntityId)) {
+                    this.server.execute { this.stopSpectating() }
+                }
+                synchronized(this.playerEntityIds) {
+                    val iter = this.playerEntityIds.object2IntEntrySet().iterator()
+                    while (iter.hasNext()) {
+                        if (packet.entityIds.contains(iter.next().intValue)) {
+                            iter.remove()
+                        }
+                    }
+                }
+            }
             is ClientboundSetObjectivePacket -> {
                 if (packet.method == ClientboundSetObjectivePacket.METHOD_REMOVE) {
                     this.objectives.remove(packet.objectiveName)
@@ -547,9 +699,27 @@ public class ReplayViewer internal constructor(
             is ClientboundPlayerInfoUpdatePacket -> {
                 for (entry in packet.newEntries()) {
                     this.players.add(entry.profileId)
+                    val profile = entry.profile
+                    if (profile != null) {
+                        synchronized(this.playerProfiles) {
+                            this.playerProfiles.put(entry.profileId, profile)
+                        }
+                    }
                 }
             }
-            is ClientboundPlayerInfoRemovePacket -> this.players.removeAll(packet.profileIds.toSet())
+            is ClientboundPlayerInfoRemovePacket -> {
+                this.players.removeAll(packet.profileIds.toSet())
+                synchronized(this.playerEntityIds) {
+                    for (uuid in packet.profileIds) {
+                        this.playerEntityIds.removeInt(uuid)
+                    }
+                }
+                synchronized(this.playerProfiles) {
+                    for (uuid in packet.profileIds) {
+                        this.playerProfiles.remove(uuid)
+                    }
+                }
+            }
             is ClientboundRespawnPacket -> this.teleported = false
         }
     }

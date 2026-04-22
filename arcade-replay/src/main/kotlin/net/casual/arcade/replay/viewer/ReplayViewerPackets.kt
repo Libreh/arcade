@@ -13,6 +13,7 @@ import net.minecraft.network.protocol.game.ClientboundContainerSetSlotPacket
 import net.minecraft.network.protocol.game.ClientboundOpenScreenPacket
 import net.minecraft.network.protocol.game.ServerboundContainerClickPacket
 import net.minecraft.network.protocol.game.ServerboundContainerClosePacket
+import net.minecraft.network.protocol.game.ServerboundRenameItemPacket
 import net.minecraft.network.protocol.game.ServerboundSetCarriedItemPacket
 
 public object ReplayViewerPackets {
@@ -20,7 +21,8 @@ public object ReplayViewerPackets {
         ServerboundKeepAlivePacket::class.java,
         ServerboundSetCarriedItemPacket::class.java,
         ServerboundContainerClickPacket::class.java,
-        ServerboundContainerClosePacket::class.java
+        ServerboundContainerClosePacket::class.java,
+        ServerboundRenameItemPacket::class.java
     )
     private val ALLOWED_CLIENTBOUND: Set<Class<out Packet<*>>> = setOf(
         ClientboundKeepAlivePacket::class.java,
