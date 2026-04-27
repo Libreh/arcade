@@ -99,6 +99,7 @@ public class ReplayViewer internal constructor(
     private val playerProfiles = HashMap<UUID, GameProfile>()
     private val entityTransforms = Int2ObjectOpenHashMap<EntityTransform>()
     private var spectatingEntityId: Int = -1
+    private var seekingSpectateId: Int = -1
 
     public data class EntityTransform(val position: Vec3, val yRot: Float, val xRot: Float)
 
@@ -110,8 +111,25 @@ public class ReplayViewer internal constructor(
     public var progress: Duration = Duration.ZERO
         private set
     private var target = Duration.ZERO
+    private var seekingTo: Duration? = null
 
     private var position = Vec3.ZERO
+
+    private val entityAddCache = Int2ObjectOpenHashMap<Packet<*>>()
+    private val ringBuffer = ArrayDeque<StateSnapshot>()
+    private var nextRingTime = Duration.ZERO
+
+    private data class StateSnapshot(
+        val timestamp: Duration,
+        val entities: IntOpenHashSet,
+        val entityTransforms: Int2ObjectOpenHashMap<EntityTransform>,
+        val entityAddPackets: Int2ObjectOpenHashMap<Packet<*>>,
+        val players: ArrayList<UUID>,
+        val playerEntityIds: Object2IntOpenHashMap<UUID>,
+        val playerProfiles: HashMap<UUID, GameProfile>,
+        val spectatingEntityId: Int,
+        val position: Vec3
+    )
 
     public var useItemHandler: ((ReplayViewer) -> Unit)? = null
     public var attackHandler: ((ReplayViewer) -> Unit)? = null
@@ -187,12 +205,145 @@ public class ReplayViewer internal constructor(
         }
 
         this.coroutineScope.launch {
-            if (reader.jumpTo(timestamp) || progress > timestamp) {
-                restart()
+            val backward = timestamp < progress
+            val ringSnap = if (backward) findRingSnapshot(timestamp) else null
+            if (ringSnap != null) {
+                ringSeek(ringSnap)
+                target = ringSnap.timestamp
+            } else if (reader.jumpTo(timestamp) || progress > timestamp) {
+                showTargetProgress(timestamp)
+                seekRestart()
+                target = timestamp
+            } else {
+                target = timestamp
             }
-            target = timestamp
         }
         return true
+    }
+
+    private fun findRingSnapshot(target: Duration): StateSnapshot? {
+        var best: StateSnapshot? = null
+        for (snap in this.ringBuffer) {
+            if (snap.timestamp <= target) best = snap else break
+        }
+        return best
+    }
+
+    private fun maybePushRingSnapshot(time: Duration) {
+        if (time < this.nextRingTime) return
+        val snap = StateSnapshot(
+            timestamp = time,
+            entities = synchronized(this.entities) { IntOpenHashSet(this.entities) },
+            entityTransforms = synchronized(this.entityTransforms) { Int2ObjectOpenHashMap(this.entityTransforms) },
+            entityAddPackets = Int2ObjectOpenHashMap(this.entityAddCache),
+            players = synchronized(this.players) { ArrayList(this.players) },
+            playerEntityIds = synchronized(this.playerEntityIds) { Object2IntOpenHashMap(this.playerEntityIds) },
+            playerProfiles = synchronized(this.playerProfiles) { HashMap(this.playerProfiles) },
+            spectatingEntityId = this.spectatingEntityId,
+            position = this.position
+        )
+        this.ringBuffer.addLast(snap)
+        this.nextRingTime = time + RING_CADENCE
+        val oldest = time - RING_WINDOW
+        while (this.ringBuffer.isNotEmpty() && this.ringBuffer.first().timestamp < oldest) {
+            this.ringBuffer.removeFirst()
+        }
+    }
+
+    private fun ringSeek(snap: StateSnapshot) {
+        this.applyRingSnapshotDiff(snap)
+        this.showTargetProgress(snap.timestamp)
+        this.reader.jumpTo(snap.timestamp)
+        this.launchStream()
+    }
+
+    private fun applyRingSnapshotDiff(snap: StateSnapshot) {
+        val currentEntities = synchronized(this.entities) { IntOpenHashSet(this.entities) }
+
+        val toRemove = IntArrayList()
+        val iter = currentEntities.iterator()
+        while (iter.hasNext()) {
+            val id = iter.nextInt()
+            if (!snap.entities.contains(id)) toRemove.add(id)
+        }
+        if (!toRemove.isEmpty) {
+            this.send(ClientboundRemoveEntitiesPacket(toRemove))
+        }
+
+        val snapIter = snap.entities.iterator()
+        while (snapIter.hasNext()) {
+            val id = snapIter.nextInt()
+            if (!currentEntities.contains(id)) {
+                val addPkt = snap.entityAddPackets.get(id)
+                if (addPkt != null) this.send(addPkt)
+            }
+        }
+
+        val snapTeleIter = snap.entities.iterator()
+        while (snapTeleIter.hasNext()) {
+            val id = snapTeleIter.nextInt()
+            val t = snap.entityTransforms.get(id) ?: continue
+            this.send(ClientboundTeleportEntityPacket(
+                id, PositionMoveRotation(t.position, Vec3.ZERO, t.yRot, t.xRot), setOf(), false
+            ))
+        }
+
+        val currentPlayers = synchronized(this.players) { HashSet(this.players) }
+        val snapPlayers = HashSet(snap.players)
+        val playersToRemove = currentPlayers.filter { it !in snapPlayers }
+        if (playersToRemove.isNotEmpty()) {
+            this.send(ClientboundPlayerInfoRemovePacket(playersToRemove))
+        }
+        val playersToAdd = snap.players.filter { it !in currentPlayers }
+        val entries = playersToAdd.mapNotNull { uuid ->
+            val profile = snap.playerProfiles[uuid] ?: return@mapNotNull null
+            ClientboundPlayerInfoUpdatePacket.Entry(
+                uuid, profile, false, 0, GameType.SPECTATOR, null, true, 0, null
+            )
+        }
+        if (entries.isNotEmpty()) {
+            this.send(ReplayViewerUtils.createClientboundPlayerInfoUpdatePacket(
+                EnumSet.of(Action.ADD_PLAYER), entries
+            ))
+        }
+
+        synchronized(this.entities) {
+            this.entities.clear()
+            val it = snap.entities.iterator()
+            while (it.hasNext()) this.entities.add(it.nextInt())
+        }
+        synchronized(this.entityTransforms) {
+            this.entityTransforms.clear()
+            this.entityTransforms.putAll(snap.entityTransforms)
+        }
+        synchronized(this.players) {
+            this.players.clear()
+            this.players.addAll(snap.players)
+        }
+        synchronized(this.playerEntityIds) {
+            this.playerEntityIds.clear()
+            this.playerEntityIds.putAll(snap.playerEntityIds)
+        }
+        synchronized(this.playerProfiles) {
+            this.playerProfiles.clear()
+            this.playerProfiles.putAll(snap.playerProfiles)
+        }
+        this.entityAddCache.clear()
+        this.entityAddCache.putAll(snap.entityAddPackets)
+        this.position = snap.position
+
+        if (snap.spectatingEntityId != -1 && snap.entities.contains(snap.spectatingEntityId)) {
+            this.spectatingEntityId = -1
+            this.spectateReplayEntity(snap.spectatingEntityId)
+        } else if (this.spectatingEntityId != -1) {
+            this.spectatingEntityId = -1
+            val buf = FriendlyByteBuf(Unpooled.buffer(5))
+            buf.writeVarInt(VIEWER_ID)
+            this.send(ClientboundSetCameraPacket.STREAM_CODEC.decode(buf))
+            this.send(ClientboundPlayerPositionPacket(
+                0, PositionMoveRotation(snap.position, Vec3.ZERO, 0.0f, 0.0f), setOf()
+            ))
+        }
     }
 
     public fun jumpToMarker(name: String?, offset: Duration): Boolean {
@@ -222,7 +373,7 @@ public class ReplayViewer internal constructor(
         }
         this.paused = paused
         this.sendTickingState()
-        this.lastSentProgress = Duration.INFINITE.unaryMinus()
+        this.lastSentProgress = Duration.INFINITE
         this.updateProgress(this.progress)
         return true
     }
@@ -352,7 +503,39 @@ public class ReplayViewer internal constructor(
         if (!this.started) {
             return
         }
+        this.ringBuffer.clear()
+        this.nextRingTime = Duration.ZERO
+        this.entityAddCache.clear()
         this.removeReplayState()
+        this.launchStream()
+    }
+
+    private fun seekRestart() {
+        if (!this.started) {
+            return
+        }
+        // Remove players and entities so snapshot can re-add them cleanly,
+        // but keep chunks loaded to avoid the "loading terrain" screen.
+        synchronized(this.players) {
+            this.send(ClientboundPlayerInfoRemovePacket(this.players))
+        }
+        synchronized(this.entities) {
+            this.send(ClientboundRemoveEntitiesPacket(IntArrayList(this.entities)))
+        }
+        synchronized(this.playerEntityIds) { this.playerEntityIds.clear() }
+        synchronized(this.playerProfiles) { this.playerProfiles.clear() }
+        synchronized(this.entityTransforms) { this.entityTransforms.clear() }
+        this.entityAddCache.clear()
+        this.ringBuffer.clear()
+        this.nextRingTime = Duration.ZERO
+        if (this.spectatingEntityId != -1) {
+            this.seekingSpectateId = this.spectatingEntityId
+            this.spectatingEntityId = -1
+        }
+        this.launchStream()
+    }
+
+    private fun launchStream() {
         this.coroutineScope.coroutineContext.cancelChildren()
         this.target = Duration.ZERO
 
@@ -399,7 +582,27 @@ public class ReplayViewer internal constructor(
                 this.playbackPacket(protocol, packet, time, active)
 
                 if (protocol == ConnectionProtocol.PLAY) {
-                    this.updateProgress(time)
+                    val seekTo = this.seekingTo
+                    when {
+                        seekTo == null -> {
+                            this.updateProgress(time)
+                            this.maybePushRingSnapshot(time)
+                        }
+                        time >= seekTo -> {
+                            this.seekingTo = null
+                            val spectateId = this.seekingSpectateId
+                            if (spectateId != -1) {
+                                this.seekingSpectateId = -1
+                                synchronized(this.entities) {
+                                    if (this.entities.contains(spectateId)) {
+                                        this.spectateReplayEntity(spectateId)
+                                    }
+                                }
+                            }
+                            this.updateProgress(time)
+                            this.maybePushRingSnapshot(time)
+                        }
+                    }
                     lastTime = time
                 }
             }
@@ -424,9 +627,21 @@ public class ReplayViewer internal constructor(
             if (!active.get()) {
                 return
             }
+            // During seek ff, suppress all client sends. State is tracked via onSendPacket;
+            // client view was pre-synced to target state via ring-diff or will be re-synced on resume.
+            if (this.seekingTo != null) {
+                return
+            }
             this.send(modified)
             this.afterSendPacket(modified)
         }
+    }
+
+    private fun showTargetProgress(timestamp: Duration) {
+        this.seekingTo = timestamp
+        this.lastSentProgress = timestamp
+        this.progress = timestamp
+        this.sendBossbarProgress(timestamp)
     }
 
     private fun updateProgress(progress: Duration) {
@@ -434,19 +649,20 @@ public class ReplayViewer internal constructor(
             return
         }
         this.lastSentProgress = progress
+        this.progress = progress
+        this.sendBossbarProgress(progress)
+    }
 
+    private fun sendBossbarProgress(timestamp: Duration) {
         val title = Component.empty()
             .append(Component.literal(this.reader.path.nameWithoutExtension).lime())
             .append(" ")
-            .append(Component.literal(progress.formatHHMMSS()).yellow().bold())
+            .append(Component.literal(timestamp.formatHHMMSS()).yellow().bold())
         if (this.paused) {
-            title.append(Component.literal(" (PAUSED)").teal())
+            title.append(Component.literal(" ⏸").teal())
         }
         this.bossbar.name = title
-
-        this.progress = progress
-        this.bossbar.progress = progress.div(this.reader.duration).toFloat()
-
+        this.bossbar.progress = timestamp.div(this.reader.duration).toFloat()
         if (this.bossbar.isVisible) {
             this.send(ClientboundBossEventPacket.createUpdateProgressPacket(this.bossbar))
             this.send(ClientboundBossEventPacket.createUpdateNamePacket(this.bossbar))
@@ -633,6 +849,7 @@ public class ReplayViewer internal constructor(
             is ClientboundForgetLevelChunkPacket -> this.chunks.remove(packet.pos.pack())
             is ClientboundAddEntityPacket -> {
                 this.entities.add(packet.id)
+                this.entityAddCache.put(packet.id, packet)
                 this.putTransform(
                     packet.id,
                     Vec3(packet.x, packet.y, packet.z),
@@ -676,6 +893,9 @@ public class ReplayViewer internal constructor(
                     for (i in 0 until packet.entityIds.size) {
                         this.entityTransforms.remove(packet.entityIds.getInt(i))
                     }
+                }
+                for (i in 0 until packet.entityIds.size) {
+                    this.entityAddCache.remove(packet.entityIds.getInt(i))
                 }
                 if (this.spectatingEntityId != -1 && packet.entityIds.contains(this.spectatingEntityId)) {
                     this.server.execute { this.stopSpectating() }
@@ -848,6 +1068,8 @@ public class ReplayViewer internal constructor(
     internal companion object {
         private const val VIEWER_ID = Int.MAX_VALUE - 10
         private val VIEWER_UUID: UUID = UUIDUtil.createOfflinePlayerUUID("-ViewingProfile-")
+        private val RING_WINDOW = 10_000.milliseconds
+        private val RING_CADENCE = 500.milliseconds
 
         fun registerEvents() {
             GlobalEventHandler.Server.register<PlayerServerboundPacketEvent>(::onPlayerServerboundPacket)
