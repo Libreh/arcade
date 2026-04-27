@@ -517,7 +517,7 @@ public class ReplayViewer internal constructor(
         // Remove players and entities so snapshot can re-add them cleanly,
         // but keep chunks loaded to avoid the "loading terrain" screen.
         synchronized(this.players) {
-            this.send(ClientboundPlayerInfoRemovePacket(this.players))
+            this.send(ClientboundPlayerInfoRemovePacket(ArrayList(this.players)))
         }
         synchronized(this.entities) {
             this.send(ClientboundRemoveEntitiesPacket(IntArrayList(this.entities)))
@@ -758,7 +758,7 @@ public class ReplayViewer internal constructor(
 
     private fun removeReplayState() {
         synchronized(this.players) {
-            this.send(ClientboundPlayerInfoRemovePacket(this.players))
+            this.send(ClientboundPlayerInfoRemovePacket(ArrayList(this.players)))
         }
         synchronized(this.entities) {
             this.send(ClientboundRemoveEntitiesPacket(IntArrayList(this.entities)))
