@@ -100,6 +100,7 @@ public class ReplayViewer internal constructor(
     private val entityTransforms = Int2ObjectOpenHashMap<EntityTransform>()
     private var spectatingEntityId: Int = -1
     private var seekingSpectateId: Int = -1
+    private var seekNeedsEntitySync = false
 
     public data class EntityTransform(val position: Vec3, val yRot: Float, val xRot: Float)
 
@@ -346,6 +347,40 @@ public class ReplayViewer internal constructor(
         }
     }
 
+    private fun resyncEntityState() {
+        val entries = synchronized(this.players) { ArrayList(this.players) }.mapNotNull { uuid ->
+            val profile = synchronized(this.playerProfiles) { this.playerProfiles[uuid] } ?: return@mapNotNull null
+            ClientboundPlayerInfoUpdatePacket.Entry(
+                uuid, profile, false, 0, GameType.SPECTATOR, null, true, 0, null
+            )
+        }
+        if (entries.isNotEmpty()) {
+            this.send(ReplayViewerUtils.createClientboundPlayerInfoUpdatePacket(
+                EnumSet.of(Action.ADD_PLAYER), entries
+            ))
+        }
+
+        val entityIds = synchronized(this.entities) { IntOpenHashSet(this.entities) }
+        val iter = entityIds.iterator()
+        while (iter.hasNext()) {
+            val id = iter.nextInt()
+            val addPkt = this.entityAddCache.get(id) ?: continue
+            this.send(addPkt)
+        }
+
+        synchronized(this.entityTransforms) {
+            val teleIter = this.entityTransforms.int2ObjectEntrySet().iterator()
+            while (teleIter.hasNext()) {
+                val entry = teleIter.next()
+                val id = entry.intKey
+                val t = entry.value
+                this.send(ClientboundTeleportEntityPacket(
+                    id, PositionMoveRotation(t.position, Vec3.ZERO, t.yRot, t.xRot), setOf(), false
+                ))
+            }
+        }
+    }
+
     public fun jumpToMarker(name: String?, offset: Duration): Boolean {
         val markers = this.markers[name]
         if (markers.isEmpty()) {
@@ -532,6 +567,7 @@ public class ReplayViewer internal constructor(
             this.seekingSpectateId = this.spectatingEntityId
             this.spectatingEntityId = -1
         }
+        this.seekNeedsEntitySync = true
         this.launchStream()
     }
 
@@ -590,6 +626,10 @@ public class ReplayViewer internal constructor(
                         }
                         time >= seekTo -> {
                             this.seekingTo = null
+                            if (this.seekNeedsEntitySync) {
+                                this.seekNeedsEntitySync = false
+                                this.resyncEntityState()
+                            }
                             val spectateId = this.seekingSpectateId
                             if (spectateId != -1) {
                                 this.seekingSpectateId = -1
@@ -629,12 +669,39 @@ public class ReplayViewer internal constructor(
             }
             // During seek ff, suppress all client sends. State is tracked via onSendPacket;
             // client view was pre-synced to target state via ring-diff or will be re-synced on resume.
+            // Exception: a ClientboundLoginPacket marks a snapshot boundary, which during a
+            // recording crosses dimensions. If we suppress it, the client stays in the old
+            // dim and crashes when subsequent chunks for the new dim arrive (section count
+            // mismatch). Exit seek mode so the snapshot's LoginPacket + chunks + entities
+            // play through and re-establish client state in the new dim.
+            // ClientboundRespawnPacket has the same concern for mid-game dim changes
+            // (e.g. nether portal): suppressing it leaves the client in the old dim
+            // and stuck on "loading terrain..." with no chance to recover.
             if (this.seekingTo != null) {
-                return
+                if (modified is ClientboundLoginPacket || modified is ClientboundRespawnPacket) {
+                    this.exitSeekModeForSnapshot()
+                } else {
+                    return
+                }
             }
             this.send(modified)
             this.afterSendPacket(modified)
         }
+    }
+
+    private fun exitSeekModeForSnapshot() {
+        // Drop chunks tracked client-side from the pre-seek dim; the upcoming LoginPacket
+        // resets the client's level so those positions become stale references.
+        synchronized(this.chunks) {
+            for (chunk in this.chunks) {
+                this.connection.send(ClientboundForgetLevelChunkPacket(ChunkPos.unpack(chunk)))
+            }
+            this.chunks.clear()
+        }
+        this.seekingTo = null
+        this.seekNeedsEntitySync = false
+        this.seekingSpectateId = -1
+        this.lastSentProgress = Duration.INFINITE
     }
 
     private fun showTargetProgress(timestamp: Duration) {
@@ -957,7 +1024,12 @@ public class ReplayViewer internal constructor(
     private fun afterSendPacket(packet: Packet<*>) {
         when (packet) {
             is ClientboundLoginPacket -> {
-                this.synchronizeClientLevel()
+                // Don't synchronizeClientLevel() here: the recording's LoginPacket already
+                // sets the dimension correctly. synchronizeClientLevel sends a respawn for
+                // the spectator's *real* server-side level, which overrides the recording's
+                // dim. When the recording is mid-nether, the client gets switched back to
+                // overworld and the next nether chunk packet (16 sections) overflows the
+                // buffer (24 sections expected) and disconnects.
                 this.send(ClientboundGameEventPacket(CHANGE_GAME_MODE, this.viewerGameMode.id.toFloat()))
                 this.sendViewerAbilities()
                 this.onReadyHandler?.invoke(this)
@@ -1068,8 +1140,8 @@ public class ReplayViewer internal constructor(
     internal companion object {
         private const val VIEWER_ID = Int.MAX_VALUE - 10
         private val VIEWER_UUID: UUID = UUIDUtil.createOfflinePlayerUUID("-ViewingProfile-")
-        private val RING_WINDOW = 10_000.milliseconds
-        private val RING_CADENCE = 500.milliseconds
+        private val RING_WINDOW = 60_000.milliseconds
+        private val RING_CADENCE = 1_000.milliseconds
 
         fun registerEvents() {
             GlobalEventHandler.Server.register<PlayerServerboundPacketEvent>(::onPlayerServerboundPacket)
